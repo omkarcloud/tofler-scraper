@@ -20,7 +20,7 @@ partially paywalled standalone view (Infosys), an unlisted company with
 full public financials (Groww), an LLP (sparse page), a director page and
 a /companylist directory page.
 """
-import json
+import fastjson
 import re
 
 from bs4 import BeautifulSoup
@@ -343,7 +343,7 @@ def _embedded_json(html, name):
     if not match:
         return None
     try:
-        return json.loads(match.group(1))
+        return fastjson.loads(match.group(1))
     except ValueError:
         return None
 

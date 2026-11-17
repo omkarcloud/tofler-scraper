@@ -43,8 +43,11 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import config
+import egress
 from scraper_errors import BadRequest, Blocked, NotFound, UpstreamError
 from tofler.refs import SITE, companylist_path
+from scraper_utils import responses, retry, sessions
+from scraper_utils.pages import page_title as _page_title
 
 IMPERSONATE = "chrome"
 PAGE_TIMEOUT = 30     # company pages are up to ~350 KB
@@ -53,12 +56,12 @@ SEARCH_TIMEOUT = 15
 PAGE_HEADERS = {
     "accept": ("text/html,application/xhtml+xml,application/xml;q=0.9,"
                "image/avif,image/webp,*/*;q=0.8"),
-    "accept-language": "en-US,en;q=0.9",
+    "accept-language": egress.site_accept_language("tofler"),
     "upgrade-insecure-requests": "1",
 }
 SEARCH_HEADERS = {
     "accept": "application/json, text/javascript, */*; q=0.01",
-    "accept-language": "en-US,en;q=0.9",
+    "accept-language": egress.site_accept_language("tofler"),
     "x-requested-with": "XMLHttpRequest",
     "origin": SITE,
     "referer": SITE + "/",
@@ -90,59 +93,24 @@ _local = threading.local()
 
 
 def _session():
-    sess = getattr(_local, "session", None)
-    if sess is None:
-        from curl_cffi import requests as curl_requests
-        sess = curl_requests.Session(impersonate=IMPERSONATE)
-        proxy = config.tofler_proxy()
-        if proxy:
-            sess.proxies = {"http": proxy, "https": proxy}
-        _local.session = sess
-    return sess
+    return sessions.thread_session(_local, lambda: sessions.curl_session(
+        IMPERSONATE, proxy_fn=config.tofler_proxy))
 
 
 def _drop_session():
     """Close the thread's session so a poisoned keep-alive connection dies."""
-    sess = getattr(_local, "session", None)
-    _local.session = None
-    if sess is not None:
-        try:
-            sess.close()
-        except Exception:
-            pass
+    sessions.drop(_local)
 
 
 def _retrying(fn):
     """Run fn() under the shared retry policy (ToflerUpstreamError only;
     NotFound / BadRequest surface immediately)."""
-    last = None
-    for attempt in range(1, config.MAX_RETRIES + 1):
-        try:
-            return fn()
-        except ToflerUpstreamError as e:
-            last = e
-            _drop_session()
-            if attempt < config.MAX_RETRIES:
-                time.sleep(config.RETRY_BACKOFF * attempt)
-    raise last
-
-
-def _page_title(text):
-    match = _TITLE_RE.search(text or "")
-    return (match.group(1).strip() if match else "")
+    return retry.run(fn, config, ToflerUpstreamError, lambda e: _drop_session())
 
 
 def _classify(resp, label):
     """Map an HTTP response to the error taxonomy; return the body text."""
-    if resp.status_code == 404:
-        raise ToflerNotFound(f"{label} not found")
-    if resp.status_code == 400:
-        raise ToflerBadRequest(resp.text[:200])
-    if resp.status_code in (401, 403, 429):
-        raise ToflerBlocked(f"HTTP {resp.status_code} for {label}")
-    if resp.status_code != 200:
-        raise ToflerUpstreamError(f"HTTP {resp.status_code} for {label}")
-    return resp.text
+    return responses.classify(resp, label, ToflerNotFound, ToflerBadRequest, ToflerBlocked, ToflerUpstreamError)
 
 
 def _get_page(path, label):
